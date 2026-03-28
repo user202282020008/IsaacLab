@@ -1,0 +1,32 @@
+<mujoco model="crazyflie_motors">
+    <compiler angle="degree" coordinate="local" inertiafromgeom="true"/>
+    <option gravity="0 0 -9.81" timestep="0.002" integrator="RK4"/>
+
+    <asset>
+        <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="512"/>
+        <texture name="grid" type="2d" builtin="checker" rgb1="0.1 0.2 0.3" rgb2="0.2 0.3 0.4" width="512" height="512"/>
+        <material name="grid_mat" texture="grid" texrepeat="1 1" texuniform="true" reflectance="0.2"/>
+    </asset>
+
+    <worldbody>
+        <light pos="0 0 5" dir="0 0 -1" directional="true"/>
+        <geom name="floor" type="plane" size="0 0 0.05" material="grid_mat"/>
+
+        <body name="base_link" pos="0 0 1.0">
+            <freejoint name="root_joint"/>
+            <geom name="core" type="box" size="0.03 0.03 0.01" mass="0.027" rgba="0.2 0.2 0.2 1"/>
+            
+            <site name="rotor1" pos="0.046 0.046 0.005" size="0.01" rgba="1 0 0 0.5"/>
+            <site name="rotor2" pos="-0.046 0.046 0.005" size="0.01" rgba="0 1 0 0.5"/>
+            <site name="rotor3" pos="-0.046 -0.046 0.005" size="0.01" rgba="0 0 1 0.5"/>
+            <site name="rotor4" pos="0.046 -0.046 0.005" size="0.01" rgba="1 1 0 0.5"/>
+        </body>
+    </worldbody>
+
+    <actuator>
+        <general name="m1_fl" site="rotor1" gear="0 0 1 0 0 -0.006"/>
+        <general name="m2_bl" site="rotor2" gear="0 0 1 0 0  0.006"/>
+        <general name="m3_br" site="rotor3" gear="0 0 1 0 0 -0.006"/>
+        <general name="m4_fr" site="rotor4" gear="0 0 1 0 0  0.006"/>
+    </actuator>
+</mujoco>
