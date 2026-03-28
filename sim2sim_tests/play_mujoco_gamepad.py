@@ -116,7 +116,9 @@ def apply_deadzone(value, threshold=0.1):
 control_dt = 0.02 
 physics_steps_per_control = int(control_dt / model.opt.timestep)
 
-print("🚀 引擎启动！请推摇杆起飞！")
+print("起飞前准备就绪！请使用手柄摇杆控制无人机，按下窗口关闭按钮退出。")
+print("提示：左摇杆控制水平移动，右摇杆控制升降和偏航。")
+
 
 # 增加一个计数器，防止打印刷屏太快看不清
 print_counter = 0
