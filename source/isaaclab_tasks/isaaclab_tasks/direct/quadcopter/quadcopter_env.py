@@ -3,9 +3,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # 上面这三行是版权声明，表示这段代码的归属和开源协议类型。
 
-
-
-
 # 从 Python 未来的版本中导入 annotations 功能，作用是让类型提示（比如标识一个变量是整数还是字符串）在当前版本也能更顺畅地使用。
 from __future__ import annotations
 
@@ -160,4 +157,287 @@ class QuadcopterEnv(DirectRLEnv):
         
         # 教练给下达的“期望速度”目标指令。
         self._desired_lin_vel_w = torch.zeros(self.num_envs, 3, device=self.device) # 期望在世界空间下的XYZ飞行速度。
-        self._desired_yaw_rate_b = torch.zeros(self.
+        self._desired_yaw_rate_b = torch.zeros(self.num_envs, 1, device=self.device) # 期望在自身空间下的左右转速度。
+
+        # 一个字典，用来累计各个维度的得分，方便最后统计这 10 秒内无人机的整体表现。
+        self._episode_sums = {
+            key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+            for key in ["tracking_lin_vel", "tracking_yaw_rate", "roll_pitch_penalty", "z_pos"]
+        }
+        
+        # 找到无人机的主体躯干部分（获取它在物理引擎里的身份证号）。
+        self._body_id = self._robot.find_bodies("body")[0]
+        # 读取无人机的质量（多重）。
+        self._robot_mass = self._robot.root_physx_view.get_masses()[0].sum()
+        # 获取重力加速度的大小（约等于 9.81）。
+        self._gravity_magnitude = torch.tensor(self.sim.cfg.gravity, device=self.device).norm()
+        # 计算无人机的标准重力（质量 乘 重力加速度 = 重量/牛顿）。
+        self._robot_weight = (self._robot_mass * self._gravity_magnitude).item()
+
+        # 告诉底层系统：按照配置文件的意思，打开红绿辅助球的可视化功能。
+        self.set_debug_vis(self.cfg.debug_vis)
+
+    # 准备 3D 场景
+    def _setup_scene(self):
+        # 按照之前写的配置实例化机器人
+        self._robot = Articulation(self.cfg.robot)
+        # 把机器人注册到场景大名单里
+        self.scene.articulations["robot"] = self._robot
+        # 同步环境数量和间距给地形生成器
+        self.cfg.terrain.num_envs = self.scene.cfg.num_envs
+        self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
+        self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
+        # 关键一步：把 1 个做好的环境，克隆出剩下的 4095 个！
+        self.scene.clone_environments(copy_from_source=False)
+        
+        # 如果你没用显卡而是用了 CPU，设置忽略跟地面的复杂内部碰撞来避免卡顿。
+        if self.device == "cpu":
+            self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
+        # 加一个照亮整个世界的大灯泡，否则画面是黑的。
+        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+        light_cfg.func("/World/Light", light_cfg)
+
+    # 物理计算发生前执行的处理（把 AI 的信号转换为真实的物理力）
+    def _pre_physics_step(self, actions: torch.Tensor):
+        # clamp 限制动作的范围在 -1.0 到 1.0 之间，防止 AI 瞎输出导致引擎崩溃。
+        clamped_actions = actions.clone().clamp(-1.0, 1.0)
+        # torch.roll 是把数组里的数据整体挪一个位置。比如 [A, B, C] 变成 [C, A, B]。
+        # 这是为了模拟延迟，把新的指令放在传送带第一位，然后挤掉最后一位。
+        self._action_history = torch.roll(self._action_history, shifts=1, dims=0)
+        self._action_history[0] = clamped_actions
+        # 从传送带的最后面拿出被延迟过的旧动作，作为当前真正要执行的动作。
+        delayed_actions = self._action_history[-1]
+        self._actions = delayed_actions
+        
+        # 数学转换：算推力。AI输出第一维 actions[:, 0] 在 [-1, 1]。
+        # (动作 + 1.0) / 2.0 把它变成了 [0, 1] 之间的比例。
+        # 再乘上 无人机重量 和 推重比，就得出了此时真实的向上推力牛顿值。
+        self._thrust[:, 0, 2] = self.cfg.thrust_to_weight * self._robot_weight * (self._actions[:, 0] + 1.0) / 2.0
+        # 其他三个维度的动作，乘以缩放系数，直接变成翻滚、俯仰和偏航的旋转力矩。
+        self._moment[:, 0, :] = self.cfg.moment_scale * self._actions[:, 1:]
+
+    # 真正把力施加到物体上
+    def _apply_action(self):
+        # 调用底层永久力矩合成器，把刚才算好的推力(forces)和旋转力(torques)狠狠推在无人机躯干(body_ids)上。
+        self._robot.permanent_wrench_composer.set_forces_and_torques(
+            body_ids=self._body_id, forces=self._thrust, torques=self._moment
+        )
+
+    # 收集无人机的观察数据（传感器信息）给 AI 大脑看
+    def _get_observations(self) -> dict:
+        # 获取无人机真实坐标系下的线速度和角速度。
+        real_lin_vel_b = self._robot.data.root_lin_vel_b
+        real_ang_vel_b = self._robot.data.root_ang_vel_b
+        # 加上配置里的正态分布噪音（torch.randn_like），糊弄一下 AI，模拟现实世界的风吹草动和劣质传感器。
+        obs_lin_vel_b = real_lin_vel_b + torch.randn_like(real_lin_vel_b) * self.cfg.lin_vel_noise_std
+        obs_ang_vel_b = real_ang_vel_b + torch.randn_like(real_ang_vel_b) * self.cfg.ang_vel_noise_std
+        
+        # 世界坐标转机体坐标。目标点是在世界里的绝对方向，但对无人机来说，它只需要知道“目标在我的前方还是左方”，所以需要四元数逆变换。
+        desired_lin_vel_b = quat_apply_inverse(self._robot.data.root_quat_w, self._desired_lin_vel_w)
+        
+        # torch.cat 把所有这些信息拼接成一根长长的数据条（13个数字），取名 "policy" 交给 AI 的神经网络。
+        obs = torch.cat(
+            [
+                obs_lin_vel_b,                         # 它以为的自己移动速度
+                obs_ang_vel_b,                         # 它以为的自己翻滚速度
+                self._robot.data.projected_gravity_b,  # 重力在它自己坐标系下的投影（让它知道自己是不是翻肚皮了）
+                desired_lin_vel_b,                     # 目标相对它的方向
+                self._desired_yaw_rate_b,              # 要求它做的自转速度
+            ],
+            dim=-1,
+        )
+        return {"policy": obs}
+
+    # 教练打分机制（核心）
+    def _get_rewards(self) -> torch.Tensor:
+        # 算出目标速度和真实速度的差异。
+        desired_lin_vel_b = quat_apply_inverse(self._robot.data.root_quat_w, self._desired_lin_vel_w)
+        # torch.linalg.norm 计算直线欧拉距离（误差）。
+        lin_vel_error = torch.linalg.norm(desired_lin_vel_b - self._robot.data.root_lin_vel_b, dim=1)
+        # 映射函数：1 - tanh(误差)。当误差很大时，tanh趋近1，得分趋近0；误差是0时，tanh是0，拿满分1分。这是一种平滑的打分方式。
+        lin_vel_mapped = 1 - torch.tanh(lin_vel_error / 1.0)
+        
+        # 算出转头速度的误差。
+        yaw_rate_error = torch.abs(self._desired_yaw_rate_b.squeeze(-1) - self._robot.data.root_ang_vel_b[:, 2])
+        yaw_rate_mapped = 1 - torch.tanh(yaw_rate_error / 1.0)
+        
+        # 惩罚项：如果 X轴(滚转) 和 Y轴(俯仰) 旋转过快，就计算平方值作为扣分依据。
+        roll_pitch_penalty = torch.sum(torch.square(self._robot.data.root_ang_vel_b[:, :2]), dim=1)
+        
+        # 高度考核：要求它尽量稳定在 Z轴 = 1.0 米 的高度。
+        z_error = torch.abs(self._robot.data.root_pos_w[:, 2] - 1.0)
+        z_pos_mapped = 1 - torch.tanh(z_error / 0.5)
+
+        # 把上面计算的基础分数乘以配置里设定的权重，再乘以 step_dt (每次计算的时间差，保证不同帧率下得分公平)。
+        rewards = {
+            "tracking_lin_vel": lin_vel_mapped * self.cfg.tracking_lin_vel_reward_scale * self.step_dt,
+            "tracking_yaw_rate": yaw_rate_mapped * self.cfg.tracking_yaw_rate_reward_scale * self.step_dt,
+            "roll_pitch_penalty": roll_pitch_penalty * self.cfg.roll_pitch_penalty_scale * self.step_dt,
+            "z_pos": z_pos_mapped * self.cfg.z_pos_reward_scale * self.step_dt,
+        }
+        # 把四项得分加总，得出当前帧总分。
+        reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
+        # 记入统计小本本。
+        for key, value in rewards.items():
+            self._episode_sums[key] += value
+        return reward
+
+    # 判断一局游戏是否结束
+    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        # 情况1：时间到了（步数超标）。
+        time_out = self.episode_length_buf >= self.max_episode_length - 1
+        # 情况2：坠毁或飞丢了（高度低于 0.1 米 或 高于 2.0 米视为阵亡）。逻辑或运算。
+        died = torch.logical_or(self._robot.data.root_pos_w[:, 2] < 0.1, self._robot.data.root_pos_w[:, 2] > 2.0)
+        return died, time_out
+
+    # 重置失败的或时间到的无人机环境
+    def _reset_idx(self, env_ids: torch.Tensor | None):
+        # 如果没指名道姓重置哪个，就全部重置。
+        if env_ids is None or len(env_ids) == self.num_envs:
+            env_ids = self._robot._ALL_INDICES
+
+        # 调用底层重置物理状态。
+        self._robot.reset(env_ids)
+        super()._reset_idx(env_ids)
+        # 如果是全局重启，把回合倒计时随机打乱一下，防止所有飞机在同一秒一起重启造成系统卡顿。
+        if len(env_ids) == self.num_envs:
+            self.episode_length_buf = torch.randint_like(self.episode_length_buf, high=int(self.max_episode_length))
+
+        # 动作清零
+        self._actions[env_ids] = 0.0
+        self._action_history[:, env_ids, :] = 0.0
+        
+        # --- 下面是一大串复杂的指令重新采样逻辑（给飞机发布新任务） ---
+        num_resets = len(env_ids) # 拿到要重置的飞机数量
+        rand_probs = torch.rand(num_resets, device=self.device) # 丢骰子决定给它派什么任务
+        new_lin_vel = torch.zeros(num_resets, 3, device=self.device)
+        
+        # 10%-20%概率：只练上下飞 (只有Z轴速度)
+        mask_z = (rand_probs >= 0.1) & (rand_probs < 0.2)
+        new_lin_vel[mask_z, 2] = torch.empty(mask_z.sum(), device=self.device).uniform_(-1.0, 1.0)
+        # 20%-40%概率：只练平飞 (XY轴速度)
+        mask_xy = (rand_probs >= 0.2) & (rand_probs < 0.4)
+        new_lin_vel[mask_xy, :2] = torch.empty(mask_xy.sum(), 2, device=self.device).uniform_(-1.5, 1.5)
+        # 40%以上概率：练习高难度 3D 立体飞行 (XYZ全随机)
+        mask_3d = rand_probs >= 0.4
+        new_lin_vel[mask_3d, :2] = torch.empty(mask_3d.sum(), 2, device=self.device).uniform_(-1.5, 1.5)
+        new_lin_vel[mask_3d, 2] = torch.empty(mask_3d.sum(), device=self.device).uniform_(-0.5, 0.5)
+        # 把新任务写入目标本子。
+        self._desired_lin_vel_w[env_ids] = new_lin_vel
+        
+        # 给一定概率派发“旋转机头”的任务
+        new_yaw_rate = torch.zeros(num_resets, 1, device=self.device)
+        turn_probs = torch.rand(num_resets, device=self.device)
+        mask_turn = turn_probs > 0.4
+        new_yaw_rate[mask_turn, 0] = torch.empty(mask_turn.sum(), device=self.device).uniform_(-1.5, 1.5)
+        self._desired_yaw_rate_b[env_ids] = new_yaw_rate
+
+        # 恢复机器人的默认物理姿势（放回地上对应点，速度清零）
+        joint_pos = self._robot.data.default_joint_pos[env_ids]
+        joint_vel = self._robot.data.default_joint_vel[env_ids]
+        default_root_state = self._robot.data.default_root_state[env_ids]
+        default_root_state[:, :3] += self._terrain.env_origins[env_ids] # 定位到各自的坑位
+        self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
+        self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
+        self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+
+    # ==========================================
+    # 4. 视觉魔法：在屏幕上画辅助线
+    # ==========================================
+    # 初始化画笔
+    def _set_debug_vis_impl(self, debug_vis: bool):
+        if debug_vis:
+            # 如果没创建过画笔，就根据顶部的模板配置依次建立各个图形的实例。
+            # 1. 在无人机中心画一个 XYZ 坐标系
+            if not hasattr(self, "frame_visualizer"):
+                cfg = FRAME_MARKER_CFG.copy()
+                cfg.prim_path = "/Visuals/Robot/CurrentFrame"
+                cfg.markers["frame"].scale = (0.1, 0.1, 0.1) 
+                self.frame_visualizer = VisualizationMarkers(cfg)
+
+            # 2. 画一个绿色的小球代表：期望速度方向
+            if not hasattr(self, "goal_lin_vel_vis"):
+                cfg = SPHERE_MARKER_CFG.copy() 
+                cfg.prim_path = "/Visuals/Command/DesiredLinVel"
+                cfg.markers["sphere"].radius = 0.02
+                # 设置材质为绿色（RGB: 0, 1, 0）
+                cfg.markers["sphere"].visual_material = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0))
+                self.goal_lin_vel_vis = VisualizationMarkers(cfg)
+
+            # 3. 画一个红色小球代表：实际速度方向
+            if not hasattr(self, "real_lin_vel_vis"):
+                cfg = SPHERE_MARKER_CFG.copy() 
+                cfg.prim_path = "/Visuals/Command/RealLinVel"
+                cfg.markers["sphere"].radius = 0.02
+                # 设置材质为红色（RGB: 1, 0, 0）
+                cfg.markers["sphere"].visual_material = sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0))
+                self.real_lin_vel_vis = VisualizationMarkers(cfg)
+
+            # 4. 青色方块代表期望自转，紫红方块代表实际自转...以此类推
+            if not hasattr(self, "goal_ang_vel_vis"):
+                cfg = CUBOID_MARKER_CFG.copy() 
+                cfg.prim_path = "/Visuals/Command/DesiredAngVel"
+                cfg.markers["cuboid"].size = (0.02, 0.02, 0.02)
+                cfg.markers["cuboid"].visual_material = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 1.0))
+                self.goal_ang_vel_vis = VisualizationMarkers(cfg)
+
+            if not hasattr(self, "real_ang_vel_vis"):
+                cfg = CUBOID_MARKER_CFG.copy() 
+                cfg.prim_path = "/Visuals/Command/RealAngVel"
+                cfg.markers["cuboid"].size = (0.02, 0.02, 0.02)
+                cfg.markers["cuboid"].visual_material = sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 1.0))
+                self.real_ang_vel_vis = VisualizationMarkers(cfg)
+
+            # 统一把它们的“是否可见”属性设为 True（显示出来）
+            self.frame_visualizer.set_visibility(True)
+            self.goal_lin_vel_vis.set_visibility(True)
+            self.real_lin_vel_vis.set_visibility(True)
+            self.goal_ang_vel_vis.set_visibility(True)
+            self.real_ang_vel_vis.set_visibility(True)
+        else:
+            # 如果关了调试，就把画笔隐藏掉
+            if hasattr(self, "frame_visualizer"): self.frame_visualizer.set_visibility(False)
+            if hasattr(self, "goal_lin_vel_vis"): self.goal_lin_vel_vis.set_visibility(False)
+            if hasattr(self, "real_lin_vel_vis"): self.real_lin_vel_vis.set_visibility(False)
+            if hasattr(self, "goal_ang_vel_vis"): self.goal_ang_vel_vis.set_visibility(False)
+            if hasattr(self, "real_ang_vel_vis"): self.real_ang_vel_vis.set_visibility(False)
+
+    # 每一帧渲染时调用的绘图函数（实时更新那些球和方块的位置）
+    def _debug_vis_callback(self, event):
+        # 还没初始化好就先不画
+        if not self._robot.is_initialized:
+            return
+
+        # 获取机器人的世界坐标(pos_w)和姿态(quat_w)
+        root_pos_w = self._robot.data.root_pos_w 
+        root_quat_w = self._robot.data.root_quat_w 
+
+        # 1. 坐标轴直接画在无人机身上
+        self.frame_visualizer.visualize(root_pos_w, root_quat_w)
+
+        # 2. 算出一个偏移位置画速度球。不能把球画在中心，不然看不清。速度越大，球离机身越远。
+        vel_scale = 0.5  # 乘个0.5当缩小系数
+        # 期望位置 = 飞机中心 + 期望速度方向向量 * 0.5
+        desired_lin_vel_pos = root_pos_w + self._desired_lin_vel_w * vel_scale
+        # 实际位置 = 飞机中心 + 实际速度方向向量 * 0.5
+        real_lin_vel_w = self._robot.data.root_lin_vel_w
+        real_lin_vel_pos = root_pos_w + real_lin_vel_w * vel_scale
+        
+        # 指挥底层的画笔在这两个算好的空间位置上把绿球和红球画出来
+        self.goal_lin_vel_vis.visualize(desired_lin_vel_pos)
+        self.real_lin_vel_vis.visualize(real_lin_vel_pos)
+
+        # 3. 画角速度的方块，逻辑同上，缩小系数为 0.2
+        ang_scale = 0.2
+        real_ang_vel_w = self._robot.data.root_ang_vel_w
+        real_ang_vel_pos = root_pos_w + real_ang_vel_w * ang_scale
+        
+        # 这里的难点：目标偏航率只设定了Z轴（只管左右转头），我们要用 quat_apply（四元数正向旋转）把它映射回世界坐标里，否则在外面看方向就不准了。
+        desired_ang_vel_b = torch.zeros_like(real_ang_vel_w)
+        desired_ang_vel_b[:, 2] = self._desired_yaw_rate_b[:, 0]
+        desired_ang_vel_w = quat_apply(root_quat_w, desired_ang_vel_b)
+        desired_ang_vel_pos = root_pos_w + desired_ang_vel_w * ang_scale
+
+        # 画出方块
+        self.goal_ang_vel_vis.visualize(desired_ang_vel_pos)
+        self.real_ang_vel_vis.visualize(real_ang_vel_pos)
