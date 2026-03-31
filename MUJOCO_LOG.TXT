@@ -13,3 +13,51 @@ WARNING: Nan, Inf or huge value in QACC at DOF 4. The simulation is unstable. Ti
 Sat Mar 28 01:11:13 2026
 WARNING: Nan, Inf or huge value in QACC at DOF 4. The simulation is unstable. Time = 14.1920.
 
+Mon Mar 30 20:23:46 2026
+WARNING: OpenGL error 0x502 in or before mjr_makeContext
+
+Mon Mar 30 20:30:16 2026
+WARNING: OpenGL error 0x502 in or before mjr_makeContext
+
+Mon Mar 30 20:34:32 2026
+WARNING: OpenGL error 0x502 in or before mjr_makeContext
+
+Mon Mar 30 20:41:22 2026
+WARNING: OpenGL error 0x502 in or before mjr_makeContext
+
+Mon Mar 30 22:27:34 2026
+WARNING: OpenGL error 0x502 in or before mjr_makeContext
+
+Mon Mar 30 22:31:44 2026
+WARNING: OpenGL error 0x502 in or before mjr_makeContext
+
+Mon Mar 30 22:33:45 2026
+WARNING: OpenGL error 0x502 in or before mjr_makeContext
+
+Mon Mar 30 22:39:41 2026
+WARNING: OpenGL error 0x502 in or before mjr_makeContext
+
+Mon Mar 30 22:43:11 2026
+WARNING: OpenGL error 0x502 in or before mjr_makeContext
+
+Mon Mar 30 22:46:23 2026
+WARNING: OpenGL error 0x502 in or before mjr_makeContext
+
+Mon Mar 30 22:50:48 2026
+WARNING: OpenGL error 0x502 in or before mjr_makeContext
+
+Mon Mar 30 22:50:48 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 3. The simulation is unstable. Time = 0.1200.
+
+Mon Mar 30 22:51:31 2026
+WARNING: OpenGL error 0x502 in or before mjr_makeContext
+
+Mon Mar 30 22:51:50 2026
+WARNING: OpenGL error 0x502 in or before mjr_makeContext
+
+Mon Mar 30 22:51:50 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 3. The simulation is unstable. Time = 1.2500.
+
+Mon Mar 30 22:53:18 2026
+WARNING: OpenGL error 0x502 in or before mjr_makeContext
+
